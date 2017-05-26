@@ -1,0 +1,8 @@
+[package]
+authors = ["chris"]
+name = "livesplit-one-terminal"
+version = "0.1.0"
+
+[dependencies]
+livesplit-core = "0.3.0"
+tui = "0.1.2"
