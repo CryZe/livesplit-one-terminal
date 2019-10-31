@@ -1,23 +1,22 @@
-#![feature(io)]
-
-extern crate tui;
-extern crate livesplit_core;
-
-use tui::Terminal;
-use tui::backend::TermionBackend;
-use tui::layout::{Group, Direction, Size};
-use tui::widgets::{Table, Widget, Paragraph};
-use tui::style::{Color, Style, Modifier};
-use livesplit_core::{Timer, Run, Segment, HotkeySystem, SharedTimer, Color as LSColor};
-use livesplit_core::component::{timer, splits, title, previous_segment, sum_of_best,
-                                possible_time_save};
-use livesplit_core::parser::composite;
-use std::{thread, io};
+use crossterm::InputEvent;
+use livesplit_core::component::{
+    possible_time_save, previous_segment, splits, sum_of_best, timer, title,
+};
+use livesplit_core::run::parser::composite;
+use livesplit_core::{
+    settings::SemanticColor as LSColor, HotkeySystem, Run, Segment, SharedTimer, Timer,
+};
+use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
-use std::time::Duration;
 use std::sync::mpsc::channel;
-use std::fs::File;
+use std::time::Duration;
+use std::{io, thread};
+use tui::backend::CrosstermBackend;
+use tui::layout::{Constraint, Direction, Layout as TuiLayout};
+use tui::style::{Color, Modifier, Style};
+use tui::widgets::{Paragraph, Row, Table, Text, Widget};
+use tui::Terminal;
 
 struct Layout {
     timer: SharedTimer,
@@ -35,11 +34,12 @@ struct Components {
 
 fn main() {
     let run = if let Ok(run) = File::open("splits.lss")
-        .map_err(|_| ())
-        .and_then(|f| composite::parse(BufReader::new(f), None, true).map_err(|_| ())) {
-        run
+        .map_err(drop)
+        .and_then(|f| composite::parse(BufReader::new(f), None, true).map_err(drop))
+    {
+        run.run
     } else {
-        let mut run = Run::new(Vec::new());
+        let mut run = Run::new();
         run.set_game_name("Breath of the Wild");
         run.set_category_name("Any%");
 
@@ -53,7 +53,7 @@ fn main() {
         run
     };
 
-    let timer = Timer::new(run).into_shared();
+    let timer = Timer::new(run).unwrap().into_shared();
     let _hotkey_system = HotkeySystem::new(timer.clone()).ok();
 
     let mut layout = Layout {
@@ -68,27 +68,18 @@ fn main() {
         },
     };
 
-    let mut terminal = Terminal::new(TermionBackend::new().unwrap()).unwrap();
+    let mut terminal = Terminal::new(CrosstermBackend::new()).unwrap();
     terminal.clear().unwrap();
     terminal.hide_cursor().unwrap();
 
     let (tx, rx) = channel();
 
+    timer.write().split_or_start();
+
     thread::spawn(move || {
-        let stdin = io::stdin();
-        for c in stdin.lock().chars() {
-            let c = c.unwrap();
-            match c {
-                'q' => break,
-                '1' => timer.write().split(),
-                '2' => timer.write().skip_split(),
-                '3' => timer.write().reset(true),
-                '4' => timer.write().switch_to_previous_comparison(),
-                '5' => timer.write().pause(),
-                '6' => timer.write().switch_to_next_comparison(),
-                '8' => timer.write().undo_split(),
-                _ => {}
-            }
+        let input = crossterm::input().read_sync();
+        for event in input {
+            tx.send(()).unwrap();
         }
         tx.send(()).unwrap();
     });
@@ -107,7 +98,7 @@ fn main() {
 }
 
 fn map_color(color: LSColor) -> Color {
-    use livesplit_core::Color::*;
+    use livesplit_core::settings::SemanticColor::*;
     match color {
         AheadGainingTime => Color::Rgb(0x00, 0xCC, 0x4B),
         AheadLosingTime => Color::Rgb(0x5C, 0xD6, 0x89),
@@ -121,90 +112,122 @@ fn map_color(color: LSColor) -> Color {
     }
 }
 
-fn draw(t: &mut Terminal<TermionBackend>, layout: &mut Layout) {
-    let size = t.size().unwrap();
+fn draw(t: &mut Terminal<CrosstermBackend>, layout: &mut Layout) {
+    let layout_settings = Default::default();
+    let splits_state = layout
+        .components
+        .splits
+        .state(&layout.timer.read(), &layout_settings);
 
-    let splits_state = layout.components.splits.state(&layout.timer.read());
+    t.draw(|mut f| {
+        let chunks = TuiLayout::default()
+            .margin(1)
+            .constraints(vec![
+                Constraint::Length(3),
+                Constraint::Length(splits_state.splits.len() as u16 + 3),
+                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .direction(Direction::Vertical)
+            .split(f.size());
 
-    Group::default()
-        .margin(1)
-        .sizes(&[Size::Fixed(3),
-                 Size::Fixed(splits_state.splits.len() as u16 + 3),
-                 Size::Fixed(2),
-                 Size::Fixed(1),
-                 Size::Fixed(1),
-                 Size::Fixed(1)])
-        .direction(Direction::Vertical)
-        .render(t, &size, |t, chunks| {
-            let state = layout.components.title.state(&layout.timer.read());
+        let state = layout.components.title.state(&layout.timer.read());
 
-            let category = format!("{:^35}", state.category);
-            let attempts = format!("{:>35}", state.attempts);
-            let category: String = category.chars()
-                .zip(attempts.chars())
-                .map(|(c, a)| if a.is_whitespace() { c } else { a })
-                .collect();
+        let category = format!("{:^35}", state.line2.unwrap_or_default());
+        let attempts = state
+            .attempts
+            .map_or_else(|| format!("{:>35}", ""), |a| format!("{:>35}", a));
+        let category: String = category
+            .chars()
+            .zip(attempts.chars())
+            .map(|(c, a)| if a.is_whitespace() { c } else { a })
+            .collect();
 
-            Paragraph::default()
-                .text(&format!("{:^35}\n{}", state.game, category))
-                .render(t, &chunks[0]);
+        Paragraph::new([Text::raw(&format!("{:^35}\n{}", state.line1, category))].iter())
+            .render(&mut f, chunks[0]);
 
-            let styles = splits_state.splits
-                .iter()
-                .map(|s| if s.is_current_split {
+        let styles = splits_state
+            .splits
+            .iter()
+            .map(|s| {
+                if s.is_current_split {
                     Style::default().fg(Color::Rgb(77, 166, 255))
                 } else {
-                    Style::default().fg(map_color(s.color))
-                })
-                .collect::<Vec<_>>();
+                    Style::default().fg(map_color(LSColor::Default))
+                }
+            })
+            .collect::<Vec<_>>();
 
-            let splits = splits_state.splits
-                .iter()
-                .zip(styles.iter())
-                .map(|(s, style)| {
-                    ([s.name.clone(), format!("{:>9}", s.delta), format!("{:>9}", s.time)], style)
-                })
-                .collect::<Vec<_>>();
+        let splits = splits_state
+            .splits
+            .iter()
+            .zip(styles.into_iter())
+            .map(|(s, style)| {
+                Row::StyledData(
+                    vec![
+                        s.name.clone(),
+                        format!("{:>9}", s.columns.get(1).map_or("", |c| &c.value)),
+                        format!("{:>9}", s.columns.get(0).map_or("", |c| &c.value)),
+                    ]
+                    .into_iter(),
+                    style,
+                )
+            })
+            .collect::<Vec<_>>();
 
-            Table::default()
-                .header(&["Split", "    Delta", "     Time"])
-                .header_style(Style::default().fg(Color::White))
-                .widths(&[15, 9, 9])
-                .style(Style::default().fg(Color::White))
-                .column_spacing(1)
-                .rows(&splits)
-                .render(t, &chunks[1]);
+        let mut labels = vec![String::from("Split")];
 
-            let state = layout.components.timer.state(&layout.timer.read());
+        for label in splits_state.column_labels.unwrap_or_default().iter().rev() {
+            labels.push(format!("{:>9}", label));
+        }
 
-            Paragraph::default()
-                .text(&format!("{:>32}{}", state.time, state.fraction))
-                .style(Style::default().modifier(Modifier::Bold).fg(map_color(state.color)))
-                .render(t, &chunks[2]);
+        Table::new(labels.into_iter(), splits.into_iter())
+            .header_style(Style::default().fg(Color::White))
+            .widths(&[15, 9, 9])
+            .style(Style::default().fg(Color::White))
+            .column_spacing(1)
+            .render(&mut f, chunks[1]);
 
-            let state = layout.components.previous_segment.state(&layout.timer.read());
+        let state = layout
+            .components
+            .timer
+            .state(&layout.timer.read(), &layout_settings);
 
-            Paragraph::default()
-                .text(&format_info_text(&state.text, &state.time))
-                .style(Style::default().fg(map_color(state.color)))
-                .render(t, &chunks[3]);
+        Paragraph::new([Text::raw(format!("{:>32}{}", state.time, state.fraction))].iter())
+            .style(
+                Style::default()
+                    .modifier(Modifier::BOLD)
+                    .fg(map_color(state.semantic_color)),
+            )
+            .render(&mut f, chunks[2]);
 
-            let state = layout.components.sum_of_best.state(&layout.timer.read());
+        let state = layout
+            .components
+            .previous_segment
+            .state(&layout.timer.read(), &layout_settings);
 
-            Paragraph::default()
-                .text(&format_info_text(&state.text, &state.time))
-                .style(Style::default().fg(Color::White))
-                .render(t, &chunks[4]);
+        Paragraph::new([Text::raw(format_info_text(&state.text, &state.time))].iter())
+            .style(Style::default().fg(map_color(state.semantic_color)))
+            .render(&mut f, chunks[3]);
 
-            let state = layout.components.possible_time_save.state(&layout.timer.read());
+        let state = layout.components.sum_of_best.state(&layout.timer.read());
 
-            Paragraph::default()
-                .text(&format_info_text(&state.text, &state.time))
-                .style(Style::default().fg(Color::White))
-                .render(t, &chunks[5]);
-        });
+        Paragraph::new([Text::raw(format_info_text(&state.text, &state.time))].iter())
+            .style(Style::default().fg(Color::White))
+            .render(&mut f, chunks[4]);
 
-    t.draw().unwrap();
+        let state = layout
+            .components
+            .possible_time_save
+            .state(&layout.timer.read());
+
+        Paragraph::new([Text::raw(format_info_text(&state.text, &state.time))].iter())
+            .style(Style::default().fg(Color::White))
+            .render(&mut f, chunks[5]);
+    })
+    .unwrap();
 }
 
 fn format_info_text(text: &str, value: &str) -> String {

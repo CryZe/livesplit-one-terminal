@@ -2,7 +2,9 @@
 authors = ["chris"]
 name = "livesplit-one-terminal"
 version = "0.1.0"
+edition = "2018"
 
 [dependencies]
-livesplit-core = "0.3.0"
-tui = "0.1.2"
+livesplit-core = "0.11.0"
+tui = { version = "0.6.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.9.6"
